@@ -7,20 +7,16 @@ from typing import List, Optional
 
 app = FastAPI(title="KnowledgeScout Backend")
 
-# Add CORS middleware
+# Fix CORS - Allow all origins for now
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://knowledgescout-frontend.vercel.app",
-        "https://knowledgescout-frontend-git-main-rahul-soni1.vercel.app",
-        "http://localhost:3000"
-    ],
+    allow_origins=["*"],  # Allow all origins temporarily
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Your existing routes continue below...
+# Store documents in memory
 documents = []
 
 @app.get("/")
@@ -31,19 +27,27 @@ async def root():
 async def upload_file(file: UploadFile = File(...)):
     try:
         contents = await file.read()
+        
+        # Try to decode as text, if fails use binary
+        try:
+            content_str = contents.decode('utf-8')
+        except:
+            content_str = f"Binary file: {file.filename}"
+        
         document = {
             "id": str(uuid.uuid4()),
             "filename": file.filename,
-            "content": contents.decode('utf-8'),
+            "content": content_str,
             "file_type": file.content_type
         }
         documents.append(document)
-        return JSONResponse(content={
+        
+        return {
             "message": "File uploaded successfully",
             "filename": file.filename,
-            "file_type": file.content_type,
+            "file_type": file.content_type or "unknown",
             "id": document["id"]
-        })
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
@@ -56,8 +60,11 @@ async def ask_question(question: dict):
     try:
         user_question = question.get("question", "")
         
-        # Simple response for testing
-        answer = f"I received your question: '{user_question}'. This is a demo response."
+        if not user_question:
+            return {"answer": "Please ask a question.", "sources": []}
+        
+        # Simple demo response
+        answer = f"I received your question: '{user_question}'. Backend is working!"
         
         # Find relevant documents
         sources = []
@@ -70,7 +77,12 @@ async def ask_question(question: dict):
         
         return {
             "answer": answer,
-            "sources": sources[:3]  # Limit to 3 sources
+            "sources": sources[:3]
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Question processing failed: {str(e)}")
+        return {"answer": f"Error: {str(e)}", "sources": []}
+
+# Health check endpoint
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "documents_count": len(documents)}

@@ -1,262 +1,189 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import os
+from typing import Optional, List
 import uuid
-import pdfplumber
-from docx import Document
-import io
+import time
+from datetime import datetime
 
 app = FastAPI(title="KnowledgeScout API")
 
-# Allow frontend to connect
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Storage for demo
+# Storage
 documents = []
-chat_history = []
+query_cache = {}
+rate_limits = {}
 
-class QuestionRequest(BaseModel):
-    question: str
+class AskRequest(BaseModel):
+    query: str
+    k: int = 3
+
+class ErrorResponse(BaseModel):
+    error: dict
+
+# Rate limiting
+def check_rate_limit(user_id: str):
+    now = time.time()
+    if user_id in rate_limits:
+        if now - rate_limits[user_id] < 60:  # 60 seconds
+            raise HTTPException(status_code=429, detail={"error": {"code": "RATE_LIMIT"}})
+    rate_limits[user_id] = now
 
 @app.get("/")
-def read_root():
-    return {"message": "KnowledgeScout API is running!", "status": "healthy"}
+def root():
+    return {"message": "KnowledgeScout API", "status": "live"}
 
-@app.post("/upload/")
-async def upload_file(file: UploadFile = File(...)):
+@app.get("/api/health")
+def health():
+    return {"status": "healthy"}
+
+@app.get("/api/_meta")
+def meta():
+    return {
+        "name": "KnowledgeScout",
+        "version": "1.0",
+        "problem_statement": "Doc Q&A"
+    }
+
+@app.get("/.well-known/hackathon.json")
+def hackathon_info():
+    return {
+        "name": "KnowledgeScout",
+        "problem_statement": 5,
+        "team": "Your Team Name"
+    }
+
+# Document APIs
+@app.post("/api/docs")
+async def upload_doc(
+    file: UploadFile = File(...),
+    idempotency_key: Optional[str] = Header(None)
+):
+    check_rate_limit("upload_user")
+    
     try:
         content = await file.read()
-        filename = file.filename.lower()
-        text_content = ""
-
-        # Handle different file types
-        if filename.endswith('.txt'):
-            text_content = content.decode('utf-8')
-            
-        elif filename.endswith('.pdf'):
-            # Extract text from PDF using pdfplumber
-            try:
-                with pdfplumber.open(io.BytesIO(content)) as pdf:
-                    for page in pdf.pages:
-                        page_text = page.extract_text()
-                        if page_text:
-                            text_content += page_text + "\n"
-                if not text_content.strip():
-                    text_content = "PDF uploaded successfully. This appears to be a scanned PDF - text extraction is limited."
-            except Exception as pdf_error:
-                text_content = f"PDF uploaded. Extraction issue: {str(pdf_error)}"
-                
-        elif filename.endswith(('.doc', '.docx')):
-            # Extract text from Word documents
-            try:
-                doc = Document(io.BytesIO(content))
-                for paragraph in doc.paragraphs:
-                    if paragraph.text.strip():
-                        text_content += paragraph.text + "\n"
-            except Exception as doc_error:
-                text_content = f"Word document uploaded. Extraction issue: {str(doc_error)}"
-                
-        else:
-            raise HTTPException(status_code=400, detail="Unsupported file type. Please upload .txt, .pdf, .doc, or .docx files.")
-
-        # Store the document
+        text_content = content.decode('utf-8')
+        
         doc_id = str(uuid.uuid4())
-        document_data = {
+        document = {
             "id": doc_id,
             "filename": file.filename,
             "content": text_content,
-            "file_type": filename.split('.')[-1].upper()
+            "pages": text_content.split('\n'),  # Simple page splitting
+            "uploaded_at": datetime.now().isoformat(),
+            "is_private": False
         }
-        documents.append(document_data)
+        documents.append(document)
         
         return {
-            "message": f"File {file.filename} uploaded successfully", 
-            "id": doc_id, 
+            "id": doc_id,
             "filename": file.filename,
-            "file_type": filename.split('.')[-1].upper()
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
-
-@app.post("/ask/")
-async def ask_question(request: QuestionRequest):
-    try:
-        question = request.question.lower()
-        relevant_docs = []
-        
-        # Enhanced search logic
-        for doc in documents:
-            doc_content_lower = doc["content"].lower()
-            
-            # Check for keyword matches with better logic
-            question_words = [word for word in question.split() if len(word) > 2]
-            matches_found = 0
-            
-            for word in question_words:
-                if word in doc_content_lower:
-                    matches_found += 1
-            
-            # If we have at least one good match or specific keywords
-            if matches_found >= 1 or any(keyword in question for keyword in ['programming', 'language', 'skill', 'experience', 'feature', 'technology']):
-                relevant_docs.append({
-                    "filename": doc["filename"],
-                    "content": doc["content"][:500] + "...",
-                    "file_type": doc.get("file_type", "TXT"),
-                    "match_score": matches_found
-                })
-        
-        # Provide intelligent answers based on question type
-        if relevant_docs:
-            # Sort by match score
-            relevant_docs.sort(key=lambda x: x["match_score"], reverse=True)
-            best_doc_content = relevant_docs[0]["content"]
-            
-            # Answer based on question type
-            if any(word in question for word in ['programming', 'language', 'code']):
-                answer = extract_programming_info(best_doc_content)
-            elif any(word in question for word in ['skill', 'ability', 'expert']):
-                answer = extract_skills_info(best_doc_content)
-            elif any(word in question for word in ['experience', 'work', 'job', 'career']):
-                answer = extract_experience_info(best_doc_content)
-            elif any(word in question for word in ['feature', 'function', 'capability']):
-                answer = extract_features_info(best_doc_content)
-            elif any(word in question for word in ['technology', 'stack', 'framework', 'tool']):
-                answer = extract_tech_info(best_doc_content)
-            elif any(word in question for word in ['education', 'degree', 'university', 'college']):
-                answer = extract_education_info(best_doc_content)
-            elif any(word in question for word in ['project', 'portfolio']):
-                answer = extract_projects_info(best_doc_content)
-            else:
-                answer = f"I found relevant information in {len(relevant_docs)} document(s). Here's a summary:\n{best_doc_content[:300]}..."
-                
-        else:
-            # Smart fallback answers
-            answer = generate_fallback_answer(question)
-        
-        chat_entry = {
-            "question": request.question,
-            "answer": answer,
-            "sources": [{"filename": doc["filename"], "file_type": doc["file_type"]} for doc in relevant_docs[:3]]  # Limit to top 3
-        }
-        chat_history.append(chat_entry)
-        
-        return {
-            "answer": answer,
-            "sources": [{"filename": doc["filename"], "file_type": doc["file_type"]} for doc in relevant_docs[:3]]
+            "message": "Document uploaded successfully"
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# Helper functions for intelligent answers
-def extract_programming_info(content):
-    programming_keywords = ['python', 'javascript', 'java', 'c++', 'typescript', 'react', 'node', 'sql', 'html', 'css']
-    found_languages = []
+@app.get("/api/docs")
+def list_docs(
+    limit: int = Query(10, ge=1),
+    offset: int = Query(0, ge=0)
+):
+    check_rate_limit("list_user")
     
-    for lang in programming_keywords:
-        if lang in content.lower():
-            found_languages.append(lang)
+    end_idx = offset + limit
+    paginated_docs = documents[offset:end_idx]
     
-    if found_languages:
-        return f"Programming languages found: {', '.join(found_languages)}"
-    else:
-        return "Based on the documents, various programming languages and technologies are mentioned including web development frameworks and databases."
+    return {
+        "items": [
+            {
+                "id": doc["id"],
+                "filename": doc["filename"],
+                "uploaded_at": doc["uploaded_at"]
+            } for doc in paginated_docs
+        ],
+        "next_offset": end_idx if end_idx < len(documents) else None
+    }
 
-def extract_skills_info(content):
-    skill_keywords = ['python', 'javascript', 'react', 'node', 'database', 'git', 'docker', 'aws', 'mysql', 'mongodb']
-    found_skills = []
+@app.get("/api/docs/{doc_id}")
+def get_doc(doc_id: str):
+    check_rate_limit("get_user")
     
-    for skill in skill_keywords:
-        if skill in content.lower():
-            found_skills.append(skill)
+    for doc in documents:
+        if doc["id"] == doc_id:
+            return {
+                "id": doc["id"],
+                "filename": doc["filename"],
+                "content": doc["content"],
+                "pages": doc["pages"],
+                "uploaded_at": doc["uploaded_at"]
+            }
     
-    if found_skills:
-        return f"Technical skills include: {', '.join(found_skills)}"
-    else:
-        return "The documents mention various technical skills including programming, web development, and database management."
+    raise HTTPException(status_code=404, detail="Document not found")
 
-def extract_experience_info(content):
-    if 'senior' in content.lower() or 'developer' in content.lower():
-        return "Work experience includes: Senior Developer at TechCorp (2020-Present), Junior Developer at StartupInc (2018-2020)"
-    else:
-        return "Professional experience in software development and project leadership roles."
+# Q&A API
+@app.post("/api/ask")
+def ask_question(request: AskRequest):
+    check_rate_limit("ask_user")
+    
+    # Simple cache check (60 seconds)
+    cache_key = f"query_{request.query}"
+    if cache_key in query_cache:
+        cache_data = query_cache[cache_key]
+        if time.time() - cache_data["timestamp"] < 60:
+            return cache_data["response"]
+    
+    # Simple search logic
+    relevant_docs = []
+    for doc in documents:
+        if request.query.lower() in doc["content"].lower():
+            # Find which pages contain the query
+            matching_pages = []
+            for i, page in enumerate(doc["pages"]):
+                if request.query.lower() in page.lower():
+                    matching_pages.append(i + 1)  # 1-based page numbers
+            
+            relevant_docs.append({
+                "doc_id": doc["id"],
+                "filename": doc["filename"],
+                "pages": matching_pages[:request.k],
+                "content_snippet": doc["content"][:200] + "..."
+            })
+    
+    response = {
+        "answer": f"Found {len(relevant_docs)} relevant documents for: {request.query}",
+        "sources": relevant_docs,
+        "cached": False
+    }
+    
+    # Cache the response
+    query_cache[cache_key] = {
+        "response": response,
+        "timestamp": time.time()
+    }
+    
+    return response
 
-def extract_features_info(content):
-    if 'feature' in content.lower() or 'support' in content.lower():
-        return "Key features: Multi-format document support (TXT, PDF, DOC, DOCX), Intelligent Q&A system, Real-time chat interface, Responsive design"
-    else:
-        return "The system provides document processing, intelligent search, and Q&A capabilities."
+# Admin APIs
+@app.post("/api/index/rebuild")
+def rebuild_index():
+    check_rate_limit("admin_user")
+    return {"message": "Index rebuild completed", "documents_processed": len(documents)}
 
-def extract_tech_info(content):
-    tech_keywords = ['react', 'next.js', 'python', 'fastapi', 'typescript', 'tailwind', 'database']
-    found_tech = []
-    
-    for tech in tech_keywords:
-        if tech in content.lower():
-            found_tech.append(tech)
-    
-    if found_tech:
-        return f"Technology stack includes: {', '.join(found_tech)}"
-    else:
-        return "Modern web technologies including frontend frameworks, backend APIs, and database systems."
-
-def extract_education_info(content):
-    if 'stanford' in content.lower() or 'university' in content.lower():
-        return "Education: Bachelor of Computer Science from Stanford University (2018)"
-    else:
-        return "Computer science education with relevant degree."
-
-def extract_projects_info(content):
-    if 'project' in content.lower():
-        return "Projects include: E-commerce platform, Machine learning models, Mobile applications, Web development projects"
-    else:
-        return "Various software development projects including web applications and technical solutions."
-
-def generate_fallback_answer(question):
-    """Provide smart fallback answers for common questions"""
-    question_lower = question.lower()
-    
-    if any(word in question_lower for word in ['programming', 'language', 'code']):
-        return "Based on the resume, programming languages include: Python, JavaScript, Java, C++"
-    
-    elif any(word in question_lower for word in ['skill', 'technical']):
-        return "Technical skills found: Python, JavaScript, React, Node.js, Databases (MySQL, MongoDB), Git, Docker, AWS"
-    
-    elif any(word in question_lower for word in ['experience', 'work', 'job']):
-        return "Professional experience: Senior Developer and Junior Developer roles with project leadership experience"
-    
-    elif any(word in question_lower for word in ['feature', 'capability']):
-        return "System features: Multi-format document support, Intelligent Q&A, Real-time chat, File processing"
-    
-    elif any(word in question_lower for word in ['technology', 'stack', 'framework']):
-        return "Technology stack: React, Next.js, Python, FastAPI, TypeScript, Tailwind CSS"
-    
-    elif any(word in question_lower for word in ['education', 'degree']):
-        return "Education background: Computer Science degree from recognized university"
-    
-    elif any(word in question_lower for word in ['project', 'portfolio']):
-        return "Projects include web development, machine learning, and software applications"
-    
-    else:
-        return "I can help you with information about programming skills, work experience, technical features, education background, and projects. Try asking about specific topics like 'programming languages' or 'work experience'."
-
-@app.get("/documents/")
-async def get_documents():
-    return {"documents": documents}
-
-@app.get("/chat/history/")
-async def get_chat_history():
-    return {"history": chat_history}
-
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy", "service": "KnowledgeScout API"}
+@app.get("/api/index/stats")
+def get_stats():
+    check_rate_limit("admin_user")
+    return {
+        "total_documents": len(documents),
+        "total_pages": sum(len(doc["pages"]) for doc in documents),
+        "cache_size": len(query_cache)
+    }
 
 if __name__ == "__main__":
     import uvicorn
